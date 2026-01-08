@@ -25,7 +25,8 @@ export default function App() {
   // -- PeerJS / Network State --
   const [peer, setPeer] = useState<Peer | null>(null);
   const [myId, setMyId] = useState<string>('');
-  const [connections, setConnections] = useState<DataConnection[]>([]);
+  // Use Ref for connections to ensure callbacks always see the latest list without stale closures
+  const connectionsRef = useRef<DataConnection[]>([]);
   const [isHost, setIsHost] = useState<boolean>(false);
   const [connectionError, setConnectionError] = useState<string>('');
 
@@ -40,16 +41,28 @@ export default function App() {
   const [showPasswordModal, setShowPasswordModal] = useState(false);
   const [copySuccess, setCopySuccess] = useState(false);
 
-  // Refs for callbacks
+  // Refs for callbacks to access latest state inside PeerJS event listeners
   const gameStateRef = useRef(gameState);
   const playersRef = useRef(players);
-  gameStateRef.current = gameState;
-  playersRef.current = players;
+  
+  // Update refs whenever state changes
+  useEffect(() => {
+    gameStateRef.current = gameState;
+  }, [gameState]);
+
+  useEffect(() => {
+    playersRef.current = players;
+  }, [players]);
 
   // --- Network Logic ---
 
   // Initialize Peer
   const initializePeer = (hostMode: boolean) => {
+    // Clean up old peer if exists
+    if (peer) {
+      peer.destroy();
+    }
+
     const newPeer = new Peer();
 
     newPeer.on('open', (id) => {
@@ -59,13 +72,14 @@ export default function App() {
       if (hostMode) {
         setIsHost(true);
         setRoomId(id);
-        setPlayers([{
+        const hostPlayer: Player = {
           id,
           name: myPlayerName || 'Host',
           team: 'spectator',
           role: 'operative',
           isHost: true
-        }]);
+        };
+        setPlayers([hostPlayer]);
         setRoute('lobby');
       } else {
         // Client mode: Connect to host
@@ -93,7 +107,11 @@ export default function App() {
 
   const handleConnection = (conn: DataConnection, amIHost: boolean) => {
     conn.on('open', () => {
-      setConnections(prev => [...prev, conn]);
+      // IMMEDIATE UPDATE: Add to ref immediately so it's available for subsequent logic
+      // This prevents race conditions where broadcast runs before state update
+      if (!connectionsRef.current.find(c => c.peer === conn.peer)) {
+         connectionsRef.current.push(conn);
+      }
       setConnectionError('');
 
       if (!amIHost) {
@@ -114,19 +132,25 @@ export default function App() {
     });
 
     conn.on('close', () => {
-      setConnections(prev => prev.filter(c => c !== conn));
+      // Remove from ref immediately
+      connectionsRef.current = connectionsRef.current.filter(c => c.peer !== conn.peer);
+      
       if (!amIHost) {
         setConnectionError('Host disconnected');
         setRoute('home');
       } else {
         // Host logic: remove player
-        // We can't easily map connection to player ID without tracking it.
-        // For simplicity, we sync active players periodically or handle clean disconnects if possible.
-        // In a simple p2p, we might just re-sync.
-        // Let's implement a heartbeat or just lazy removal if strictness needed.
-        // For this demo: we won't auto-remove to prevent accidental drops, 
-        // but normally we would filter `players` based on active connections.
+        const playerId = conn.peer;
+        const remainingPlayers = playersRef.current.filter(p => p.id !== playerId);
+        if (remainingPlayers.length !== playersRef.current.length) {
+            setPlayers(remainingPlayers);
+            broadcast(remainingPlayers, gameStateRef.current);
+        }
       }
+    });
+    
+    conn.on('error', (err) => {
+        console.error("Connection error: ", err);
     });
   };
 
@@ -135,36 +159,38 @@ export default function App() {
       // --- HOST LOGIC ---
       switch (msg.type) {
         case 'JOIN_REQUEST':
+          const newPlayerId = msg.senderId || conn.peer;
           const newPlayer: Player = {
-            id: msg.senderId || conn.peer,
+            id: newPlayerId,
             name: msg.payload.name,
             team: 'spectator',
             role: 'operative',
             isHost: false
           };
-          // Check if already exists
-          if (!playersRef.current.find(p => p.id === newPlayer.id)) {
-            const newPlayers = [...playersRef.current, newPlayer];
-            setPlayers(newPlayers);
-            broadcast(newPlayers, gameStateRef.current);
+          
+          // Check if already exists to prevent dupes
+          let currentPlayers = playersRef.current;
+          if (!currentPlayers.find(p => p.id === newPlayer.id)) {
+            currentPlayers = [...currentPlayers, newPlayer];
           } else {
-             // Re-sync just in case
-             broadcast(playersRef.current, gameStateRef.current);
+            // Update name if reconnecting
+             currentPlayers = currentPlayers.map(p => p.id === newPlayer.id ? { ...p, name: newPlayer.name } : p);
           }
+          
+          setPlayers(currentPlayers);
+          // Broadcast using the explicit list we just created to avoid any ref lag
+          broadcast(currentPlayers, gameStateRef.current);
           break;
 
         case 'ACTION_CHANGE_TEAM':
-          // Locked if game started
           if (gameStateRef.current.status !== 'lobby') return;
           updatePlayer(msg.senderId!, { team: msg.payload.team, role: 'operative' });
           break;
 
         case 'ACTION_CHANGE_ROLE':
-           // Locked if game started
            if (gameStateRef.current.status !== 'lobby') return;
-           // Ensure only one spymaster per team
            const teamPlayers = playersRef.current.filter(p => p.team === msg.payload.team);
-           const hasSpymaster = teamPlayers.some(p => p.role === 'spymaster');
+           const hasSpymaster = teamPlayers.some(p => p.role === 'spymaster' && p.id !== msg.senderId);
            if (msg.payload.role === 'spymaster' && hasSpymaster) return; // Deny
            
            updatePlayer(msg.senderId!, { role: msg.payload.role });
@@ -204,16 +230,20 @@ export default function App() {
   // --- Host Helper Functions ---
 
   const broadcast = (currentPlayers: Player[], currentGameState: GameState) => {
-    // Send to all connections
-    connections.forEach(conn => {
+    // Use connectionsRef.current to ensure we have the latest connections
+    // even inside stale closures
+    connectionsRef.current.forEach(conn => {
       if (conn.open) {
         conn.send({ type: 'SYNC_PLAYERS', payload: currentPlayers });
         conn.send({ type: 'SYNC_STATE', payload: currentGameState });
       }
     });
+    
     // Update local state (Host is also a player)
-    setPlayers(currentPlayers);
-    setGameState(currentGameState);
+    // We only update if the references are different to avoid loops/unnecessary renders,
+    // though React handles this well usually.
+    if (currentPlayers !== playersRef.current) setPlayers(currentPlayers);
+    if (currentGameState !== gameStateRef.current) setGameState(currentGameState);
   };
 
   const updatePlayer = (playerId: string, updates: Partial<Player>) => {
@@ -259,20 +289,18 @@ export default function App() {
     // Check if turn ends
     if (revealedCard.type === 'assassin') {
         winner = currentState.currentTurn === 'red' ? 'blue' : 'red';
-        nextTurn = currentState.currentTurn === 'red' ? 'blue' : 'red'; // Doesn't matter, game over
+        nextTurn = currentState.currentTurn === 'red' ? 'blue' : 'red';
     } else if (revealedCard.type === 'neutral') {
         nextTurn = currentState.currentTurn === 'red' ? 'blue' : 'red';
     } else if (revealedCard.type !== currentState.currentTurn) {
         // Picked opponent's card
         nextTurn = currentState.currentTurn === 'red' ? 'blue' : 'red';
     } else {
-        // Picked own card, turn continues unless they want to stop (handled by end turn button)
-        // Check win condition immediately
+        // Picked own card
         const potentialWinner = getWinner(newCards, currentState.currentTurn);
         if (potentialWinner) winner = potentialWinner;
     }
 
-    // Check win condition (if revealed opponent's last card by mistake)
     if (!winner) {
          winner = getWinner(newCards, currentState.currentTurn);
     }
@@ -307,9 +335,11 @@ export default function App() {
     } else {
        // Send to host
        // Find connection to host (usually the only one in client mode)
-       const conn = connections[0];
+       const conn = connectionsRef.current[0];
        if (conn && conn.open) {
            conn.send({ type, payload });
+       } else {
+           console.warn("No connection to host found");
        }
     }
   };
@@ -338,22 +368,25 @@ export default function App() {
   };
 
   const copyRoomLink = () => {
-    // In a real deployed app, this would include the URL. 
-    // Since this is likely a pasted file, we just copy the Room ID or a simulated link.
-    // Let's assume hash routing for link sharing if we implemented reading hash on load.
     const link = `${window.location.origin}${window.location.pathname}#${roomId}`;
     navigator.clipboard.writeText(link);
     setCopySuccess(true);
     setTimeout(() => setCopySuccess(false), 2000);
   };
 
-  // Check URL hash on load for auto-join
   useEffect(() => {
     const hash = window.location.hash.substring(1);
     if (hash && hash.length > 0) {
        setInputRoomId(hash);
     }
   }, []);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+        if (peer) peer.destroy();
+    }
+  }, [peer]);
 
 
   // --- Views ---
