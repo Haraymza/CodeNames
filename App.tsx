@@ -128,6 +128,11 @@ export default function App() {
 
     conn.on('data', (data: any) => {
       const msg = data as NetworkMessage;
+      // IMPORTANT: Host must identify the sender to process actions correctly
+      if (amIHost) {
+          // If senderId is missing or we want to enforce source truth, use conn.peer
+          msg.senderId = conn.peer;
+      }
       handleMessage(msg, conn, amIHost);
     });
 
@@ -184,16 +189,18 @@ export default function App() {
 
         case 'ACTION_CHANGE_TEAM':
           if (gameStateRef.current.status !== 'lobby') return;
-          updatePlayer(msg.senderId!, { team: msg.payload.team, role: 'operative' });
+          if (!msg.senderId) return; // Guard against undefined sender
+          updatePlayer(msg.senderId, { team: msg.payload.team, role: 'operative' });
           break;
 
         case 'ACTION_CHANGE_ROLE':
            if (gameStateRef.current.status !== 'lobby') return;
+           if (!msg.senderId) return;
            const teamPlayers = playersRef.current.filter(p => p.team === msg.payload.team);
            const hasSpymaster = teamPlayers.some(p => p.role === 'spymaster' && p.id !== msg.senderId);
            if (msg.payload.role === 'spymaster' && hasSpymaster) return; // Deny
            
-           updatePlayer(msg.senderId!, { role: msg.payload.role });
+           updatePlayer(msg.senderId, { role: msg.payload.role });
            break;
         
         case 'ACTION_START_GAME':
@@ -202,12 +209,14 @@ export default function App() {
 
         case 'ACTION_REVEAL':
            if (gameStateRef.current.status !== 'playing') return;
-           handleCardClickHost(msg.payload.index, msg.senderId!);
+           if (!msg.senderId) return;
+           handleCardClickHost(msg.payload.index, msg.senderId);
            break;
 
         case 'ACTION_END_TURN':
             if (gameStateRef.current.status !== 'playing') return;
-            endTurnHost(msg.senderId!);
+            if (!msg.senderId) return;
+            endTurnHost(msg.senderId);
             break;
             
         case 'ACTION_RESET':
@@ -337,7 +346,8 @@ export default function App() {
        // Find connection to host (usually the only one in client mode)
        const conn = connectionsRef.current[0];
        if (conn && conn.open) {
-           conn.send({ type, payload });
+           // Ensure senderId is explicitly sent
+           conn.send({ type, payload, senderId: myId });
        } else {
            console.warn("No connection to host found");
        }
