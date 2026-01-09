@@ -1,6 +1,7 @@
 export type Team = 'red' | 'blue';
 export type CardType = 'red' | 'blue' | 'neutral' | 'assassin';
 export type GameStatus = 'lobby' | 'playing' | 'red_win' | 'blue_win';
+export type TurnPhase = 'hinting' | 'guessing';
 
 export interface Player {
   id: string; // Peer ID
@@ -16,10 +17,18 @@ export interface Card {
   revealed: boolean;
 }
 
+export interface Hint {
+  word: string;
+  count: number;
+}
+
 export interface GameState {
   status: GameStatus;
   cards: Card[];
   currentTurn: Team;
+  turnPhase: TurnPhase;
+  currentHint: Hint | null;
+  guessesMade: number;
   startingTeam: Team;
   winner: Team | null;
   lastUpdate: number;
@@ -35,7 +44,8 @@ export type MessageType =
   | 'ACTION_START_GAME'
   | 'ACTION_RESET'
   | 'ACTION_CHANGE_TEAM'
-  | 'ACTION_CHANGE_ROLE';
+  | 'ACTION_CHANGE_ROLE'
+  | 'ACTION_SUBMIT_HINT';
 
 export interface NetworkMessage {
   type: MessageType;
