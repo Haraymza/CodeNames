@@ -54,6 +54,19 @@ export default function App() {
     playersRef.current = players;
   }, [players]);
 
+  // -- Routing Logic --
+  // Automatically switch views when game status changes
+  useEffect(() => {
+    if (route === 'home') return; // Don't redirect if in home screen
+
+    if (gameState.status === 'playing' || gameState.status === 'red_win' || gameState.status === 'blue_win') {
+        if (route !== 'game') setRoute('game');
+    } else if (gameState.status === 'lobby') {
+        if (route !== 'lobby') setRoute('lobby');
+    }
+  }, [gameState.status, route]);
+
+
   // --- Network Logic ---
 
   // Initialize Peer
@@ -270,13 +283,14 @@ export default function App() {
       cards,
       startingTeam,
       currentTurn: startingTeam,
-      winner: null
+      winner: null,
+      lastUpdate: Date.now()
     };
     broadcast(playersRef.current, newState);
   };
 
   const resetGameHost = () => {
-      broadcast(playersRef.current, INITIAL_STATE);
+      broadcast(playersRef.current, { ...INITIAL_STATE, lastUpdate: Date.now() });
   };
 
   const handleCardClickHost = (index: number, playerId: string) => {
