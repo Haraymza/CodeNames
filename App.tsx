@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Peer, { DataConnection } from 'peerjs';
-import { GameState, Player, MessageType, NetworkMessage, Team, GameStatus } from './types';
+import { GameState, Player, MessageType, NetworkMessage, Team, GameStatus, TurnPhase } from './types';
 import { generateBoard, getWinner } from './utils';
 import { PASSWORD } from './constants';
 import { GameCard } from './components/GameCard';
-import { Crown, Users, Copy, Check, ShieldAlert, Play, LogOut, ArrowRight, X } from 'lucide-react';
+import { Crown, Users, Copy, Check, ShieldAlert, Play, LogOut, ArrowRight, X, MessageSquare } from 'lucide-react';
 import { clsx } from 'clsx';
 
 // Initial dummy state
@@ -13,6 +13,9 @@ const INITIAL_STATE: GameState = {
   cards: [],
   currentTurn: 'red',
   startingTeam: 'red',
+  turnPhase: 'hinting',
+  currentHint: null,
+  guessesMade: 0,
   winner: null,
   lastUpdate: Date.now(),
 };
@@ -40,6 +43,10 @@ export default function App() {
   const [passwordInput, setPasswordInput] = useState('');
   const [showPasswordModal, setShowPasswordModal] = useState(false);
   const [copySuccess, setCopySuccess] = useState(false);
+  
+  // -- Spymaster UI State --
+  const [hintWord, setHintWord] = useState('');
+  const [hintCount, setHintCount] = useState(1);
 
   // Refs for callbacks to access latest state inside PeerJS event listeners
   const gameStateRef = useRef(gameState);
@@ -220,6 +227,12 @@ export default function App() {
            startGame();
            break;
 
+        case 'ACTION_SUBMIT_HINT':
+           if (gameStateRef.current.status !== 'playing') return;
+           if (!msg.senderId) return;
+           submitHintHost(msg.payload.word, msg.payload.count, msg.senderId);
+           break;
+
         case 'ACTION_REVEAL':
            if (gameStateRef.current.status !== 'playing') return;
            if (!msg.senderId) return;
@@ -252,8 +265,6 @@ export default function App() {
   // --- Host Helper Functions ---
 
   const broadcast = (currentPlayers: Player[], currentGameState: GameState) => {
-    // Use connectionsRef.current to ensure we have the latest connections
-    // even inside stale closures
     connectionsRef.current.forEach(conn => {
       if (conn.open) {
         conn.send({ type: 'SYNC_PLAYERS', payload: currentPlayers });
@@ -261,9 +272,6 @@ export default function App() {
       }
     });
     
-    // Update local state (Host is also a player)
-    // We only update if the references are different to avoid loops/unnecessary renders,
-    // though React handles this well usually.
     if (currentPlayers !== playersRef.current) setPlayers(currentPlayers);
     if (currentGameState !== gameStateRef.current) setGameState(currentGameState);
   };
@@ -283,6 +291,9 @@ export default function App() {
       cards,
       startingTeam,
       currentTurn: startingTeam,
+      turnPhase: 'hinting',
+      currentHint: null,
+      guessesMade: 0,
       winner: null,
       lastUpdate: Date.now()
     };
@@ -293,13 +304,30 @@ export default function App() {
       broadcast(playersRef.current, { ...INITIAL_STATE, lastUpdate: Date.now() });
   };
 
+  const submitHintHost = (word: string, count: number, playerId: string) => {
+    const player = playersRef.current.find(p => p.id === playerId);
+    const currentState = gameStateRef.current;
+
+    // Validate spymaster of current turn
+    if (!player || player.team !== currentState.currentTurn || player.role !== 'spymaster') return;
+    if (currentState.turnPhase !== 'hinting') return;
+
+    const newState = {
+      ...currentState,
+      turnPhase: 'guessing' as const,
+      currentHint: { word, count },
+      guessesMade: 0
+    };
+    broadcast(playersRef.current, newState);
+  };
+
   const handleCardClickHost = (index: number, playerId: string) => {
     const player = playersRef.current.find(p => p.id === playerId);
     const currentState = gameStateRef.current;
     
     // Validation
     if (!player || player.team !== currentState.currentTurn || player.role !== 'operative') return;
-    if (currentState.cards[index].revealed) return;
+    if (currentState.turnPhase !== 'guessing') return;
 
     // Reveal Logic
     const newCards = [...currentState.cards];
@@ -307,31 +335,53 @@ export default function App() {
     const revealedCard = newCards[index];
 
     let nextTurn = currentState.currentTurn;
+    // Fix: Explicitly type as TurnPhase because TS narrows it to 'guessing' due to the check above
+    let nextPhase: TurnPhase = currentState.turnPhase;
+    let nextHint = currentState.currentHint;
+    let nextGuessesMade = currentState.guessesMade;
     let winner = currentState.winner;
+    let shouldEndTurn = false;
 
-    // Check if turn ends
+    // Check card type
     if (revealedCard.type === 'assassin') {
         winner = currentState.currentTurn === 'red' ? 'blue' : 'red';
-        nextTurn = currentState.currentTurn === 'red' ? 'blue' : 'red';
     } else if (revealedCard.type === 'neutral') {
-        nextTurn = currentState.currentTurn === 'red' ? 'blue' : 'red';
+        shouldEndTurn = true;
     } else if (revealedCard.type !== currentState.currentTurn) {
-        // Picked opponent's card
-        nextTurn = currentState.currentTurn === 'red' ? 'blue' : 'red';
+        // Picked opponent's card -> End turn
+        shouldEndTurn = true;
     } else {
-        // Picked own card
+        // Picked own card -> Increment guesses
+        nextGuessesMade++;
         const potentialWinner = getWinner(newCards, currentState.currentTurn);
-        if (potentialWinner) winner = potentialWinner;
+        if (potentialWinner) {
+          winner = potentialWinner;
+        } else {
+           // Check guess limit (Hint Number + 1)
+           if (currentState.currentHint && nextGuessesMade >= currentState.currentHint.count + 1) {
+             shouldEndTurn = true;
+           }
+        }
     }
 
     if (!winner) {
          winner = getWinner(newCards, currentState.currentTurn);
     }
 
+    if (shouldEndTurn && !winner) {
+        nextTurn = currentState.currentTurn === 'red' ? 'blue' : 'red';
+        nextPhase = 'hinting';
+        nextHint = null;
+        nextGuessesMade = 0;
+    }
+
     const newState = {
         ...currentState,
         cards: newCards,
         currentTurn: nextTurn,
+        turnPhase: nextPhase,
+        currentHint: nextHint,
+        guessesMade: nextGuessesMade,
         winner: winner ? winner : null,
         status: winner ? (winner === 'red' ? 'red_win' : 'blue_win') as GameStatus : 'playing'
     };
@@ -342,10 +392,20 @@ export default function App() {
   const endTurnHost = (playerId: string) => {
       const player = playersRef.current.find(p => p.id === playerId);
       const currentState = gameStateRef.current;
+      
+      // Can only end turn if guessing
       if (!player || player.team !== currentState.currentTurn) return;
+      if (currentState.turnPhase !== 'guessing') return;
 
       const nextTurn = currentState.currentTurn === 'red' ? 'blue' : 'red';
-      broadcast(playersRef.current, { ...currentState, currentTurn: nextTurn });
+      
+      broadcast(playersRef.current, { 
+        ...currentState, 
+        currentTurn: nextTurn,
+        turnPhase: 'hinting',
+        currentHint: null,
+        guessesMade: 0
+      });
   };
 
 
@@ -357,15 +417,20 @@ export default function App() {
       handleMessage({ type, payload, senderId: myId }, null as any, true);
     } else {
        // Send to host
-       // Find connection to host (usually the only one in client mode)
        const conn = connectionsRef.current[0];
        if (conn && conn.open) {
-           // Ensure senderId is explicitly sent
            conn.send({ type, payload, senderId: myId });
        } else {
            console.warn("No connection to host found");
        }
     }
+  };
+  
+  const submitHint = () => {
+    if (!hintWord.trim()) return;
+    sendAction('ACTION_SUBMIT_HINT', { word: hintWord.trim(), count: hintCount });
+    setHintWord(''); // Reset local input
+    setHintCount(1);
   };
 
   // --- UI Handlers ---
@@ -634,6 +699,13 @@ export default function App() {
     const blueScore = gameState.cards.filter(c => c.type === 'blue' && !c.revealed).length;
     const isMyTurn = myPlayer.team === gameState.currentTurn;
     const isGameOver = gameState.status === 'red_win' || gameState.status === 'blue_win';
+    
+    // Spymaster / Hint Logic Variables
+    const isHintingPhase = gameState.turnPhase === 'hinting';
+    const isGuessingPhase = gameState.turnPhase === 'guessing';
+    const isMyRoleToAct = 
+      (isHintingPhase && myPlayer.role === 'spymaster' && isMyTurn) ||
+      (isGuessingPhase && myPlayer.role === 'operative' && isMyTurn);
 
     return (
       <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col">
@@ -699,7 +771,7 @@ export default function App() {
                         key={idx}
                         card={card}
                         isSpymaster={myPlayer.role === 'spymaster'}
-                        canInteract={!isGameOver && isMyTurn && myPlayer.role === 'operative'}
+                        canInteract={!isGameOver && isMyRoleToAct && isGuessingPhase && myPlayer.role === 'operative'}
                         onClick={() => sendAction('ACTION_REVEAL', { index: idx })}
                      />
                   ))}
@@ -710,29 +782,81 @@ export default function App() {
          {/* Bottom Action Bar */}
          {!isGameOver && (
             <div className="bg-slate-800 border-t border-slate-700 p-4 sticky bottom-0 z-30">
-               <div className="max-w-6xl mx-auto flex justify-between items-center">
-                  <div className="text-sm text-slate-400 hidden md:block">
+               <div className="max-w-6xl mx-auto flex justify-between items-center gap-4">
+                  <div className="text-sm text-slate-400 hidden md:block w-32">
                      Developed by xro
                   </div>
                   
-                  <div className="flex-1 flex justify-center">
-                     {myPlayer.role === 'spymaster' && isMyTurn ? (
-                        <div className="text-yellow-500 font-bold animate-pulse">
-                           Give a clue to your operatives!
-                        </div>
-                     ) : myPlayer.role === 'operative' && isMyTurn ? (
-                        <button 
-                           onClick={() => sendAction('ACTION_END_TURN')}
-                           className="bg-slate-700 hover:bg-slate-600 text-white px-6 py-3 rounded-full font-bold flex items-center gap-2 transition-all hover:scale-105"
-                        >
-                           End Turn <ArrowRight className="w-4 h-4" />
-                        </button>
-                     ) : (
-                        <div className="text-slate-500 italic">
-                           Waiting for {gameState.currentTurn} team...
+                  <div className="flex-1 flex justify-center items-center">
+                     {/* CASE 1: HINTING PHASE */}
+                     {isHintingPhase && (
+                         isMyRoleToAct ? (
+                            <div className="flex gap-2 w-full max-w-lg animate-in slide-in-from-bottom-2">
+                               <input 
+                                  type="text" 
+                                  value={hintWord}
+                                  onChange={e => setHintWord(e.target.value)}
+                                  placeholder="Enter clue word"
+                                  className="flex-1 bg-slate-900 border border-slate-600 rounded-lg px-4 py-2 focus:ring-2 focus:ring-blue-500"
+                               />
+                               <select 
+                                  value={hintCount}
+                                  onChange={e => setHintCount(parseInt(e.target.value))}
+                                  className="bg-slate-900 border border-slate-600 rounded-lg px-4 py-2 focus:ring-2 focus:ring-blue-500 w-20"
+                               >
+                                  {[1,2,3,4,5,6,7,8,9].map(n => (
+                                     <option key={n} value={n}>{n}</option>
+                                  ))}
+                               </select>
+                               <button 
+                                  onClick={submitHint}
+                                  disabled={!hintWord.trim()}
+                                  className="bg-green-600 hover:bg-green-500 disabled:bg-slate-700 disabled:text-slate-500 text-white px-6 py-2 rounded-lg font-bold"
+                               >
+                                  Give Clue
+                               </button>
+                            </div>
+                         ) : (
+                            <div className="flex items-center gap-2 text-slate-400">
+                               <div className="w-2 h-2 bg-slate-500 rounded-full animate-bounce" style={{animationDelay: '0s'}}></div>
+                               <div className="w-2 h-2 bg-slate-500 rounded-full animate-bounce" style={{animationDelay: '0.2s'}}></div>
+                               <div className="w-2 h-2 bg-slate-500 rounded-full animate-bounce" style={{animationDelay: '0.4s'}}></div>
+                               <span>Waiting for Spymaster clue...</span>
+                            </div>
+                         )
+                     )}
+
+                     {/* CASE 2: GUESSING PHASE */}
+                     {isGuessingPhase && (
+                        <div className="flex flex-col md:flex-row items-center gap-4 w-full justify-center">
+                            <div className="bg-slate-900/80 px-4 py-2 rounded-lg border border-slate-700 flex items-center gap-3">
+                                <MessageSquare className="w-4 h-4 text-slate-400" />
+                                <span className="font-bold text-white uppercase">{gameState.currentHint?.word}</span>
+                                <span className="bg-slate-700 px-2 py-0.5 rounded text-xs text-slate-300 font-mono">
+                                    {gameState.currentHint?.count}
+                                </span>
+                            </div>
+                            
+                            {isMyRoleToAct ? (
+                                <div className="flex items-center gap-4">
+                                   <span className="text-sm text-slate-400">
+                                      Guesses: {gameState.guessesMade} / {gameState.currentHint ? gameState.currentHint.count + 1 : 1}
+                                   </span>
+                                   <button 
+                                      onClick={() => sendAction('ACTION_END_TURN')}
+                                      className="bg-slate-700 hover:bg-slate-600 text-white px-6 py-2 rounded-full font-bold flex items-center gap-2 transition-all hover:scale-105"
+                                   >
+                                      End Turn <ArrowRight className="w-4 h-4" />
+                                   </button>
+                                </div>
+                            ) : (
+                                <span className="text-slate-500 italic text-sm">Operatives are guessing...</span>
+                            )}
                         </div>
                      )}
                   </div>
+
+                  <div className="w-32"></div> {/* Spacer for symmetry */}
                </div>
             </div>
          )}
